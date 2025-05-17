@@ -436,6 +436,45 @@ func main() {
 }
 ```
 
+```mermaid
+classDiagram
+    class TimeProvider {
+        <<interface>>
+        +Now() time.Time
+    }
+    
+    class RealTimeProvider {
+        +Now() time.Time
+    }
+    
+    class StubTimeProvider {
+        +FixedTime time.Time
+        +Now() time.Time
+    }
+    
+    class GreetWithTimeProvider {
+        <<function>>
+        +GreetWithTimeProvider(name string, timeProvider TimeProvider) string
+    }
+    
+    class TestGreetWithTimeProvider {
+        <<function>>
+        +TestGreetWithTimeProvider(t *testing.T)
+    }
+    
+    class Main {
+        <<function>>
+    }
+    
+    RealTimeProvider ..|> TimeProvider : implements
+    StubTimeProvider ..|> TimeProvider : implements
+    GreetWithTimeProvider --> TimeProvider : depends on
+    TestGreetWithTimeProvider --> StubTimeProvider : creates
+    TestGreetWithTimeProvider --> GreetWithTimeProvider : calls with stub
+    Main --> RealTimeProvider : creates
+    Main --> GreetWithTimeProvider : calls with real
+```
+
 **時間相關測試的最佳實踐**
 1. 永遠不要直接使用 `time.Now()`：哪怕需求是**現在**，如果在函數內部直接調用，將會無法測試，可以通過依賴注入傳入
 2. 定義 TimeProvier 介面：使代碼更容易進行單元測試
