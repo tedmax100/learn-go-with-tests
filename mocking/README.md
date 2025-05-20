@@ -185,8 +185,87 @@ func main() {
 
 
 # 自動產生 Mock
-
 - [Gomock](https://github.com/uber-go/mock)
+
+當測試對象的依賴關係頗複雜時，並且有些依賴難以直接建立來測試。我們通常會考慮用 gomock 這工具來輔助產生測試用的mock對象程式碼。
+
+舉例，我們有 UserRepositry interface，而 User Service 是我們的測試對象且依賴著它。
+```
+.
+├── entity
+│   └── user.go
+├── go.mod
+├── go.sum
+├── makefile
+├── repository
+│   ├── interface.go
+│   └── mock_repo.go
+└── service
+    ├── user.go
+    └── user_test.go
+```
+```go
+type User struct {
+	Id uuid.UUID
+	Name string
+}
+
+type IUserRepository interface {
+	// db tranction
+	Transaction(context.Context, func(context.Context) error ) error
+	GetUser(context.Context, *User) (error)
+	UpdateUsers(context.Context, User[]) (error)
+}
+
+type UserService struct{
+	repo IUserRepository
+}
+
+func New(repo IUserRepository) *UserService{
+	return &UserService{
+		repo: repo,
+	}
+}
+
+func (u *UserService) GetUser(ctx context.Context, user *User) (error){
+	return u.repo.GetUser(ctx, user) 
+}
+
+func (u *UserService) GetUser(ctx context.Context, users User[]) (error){
+	return u.repo.Transaction(ctx, func(ctx context.Context) error{
+		if err := u.repo.UpdateUsers(ctx, users); err != nil {
+			return err
+		}
+		return nil
+	}) 
+}
+```
+
+如果我們要對 `UserService` 設計單元測試，那勢必要 mock `IUserRepository`。因為我們有了repository的介面，透過建構式注入了。所以單元測試只要產生mock的程式碼就好。
+
+我能透過 gomock 的 mockgen 功能快速產生mock程式碼。
+我希望mock的對象是`repository/interface.go`，然後產生的程式碼放在`repository/mock_repo.go`，其package namespace為 `repository`。這樣就生成好了。
+```bash
+mockgen -source=repository/interface.go -destination=repository/mock_repo.go -package=repository
+```
+
+```go
+// 這行建立一個新的 Controller，它是 gomock 的核心物件，負責管理 mock 物件的生命周期和呼叫驗證。t 用來報告測試錯誤。
+ctrl := gomock.NewController(t)
+// 這會在函式結束時呼叫 Finish()，用來檢查所有預期的 mock 呼叫是否都被執行過（即驗證 mock 物件的行為是否符合預期）。
+// 如果有預期的呼叫沒被執行，測試會失敗。
+defer ctrl.Finish()
+
+// 這行是建立一個 UserStore 介面的 mock 實例。
+// NewMockUserStore 是由 mockgen 自動生成的函式，會根據你定義的 UserStore 介面建立一個 mock 物件。傳入 ctrl 是讓這個 mock 物件能被 gomock 控制和管理。
+mockRepo := repository.NewMockIUserRepository(ctrl)
+
+// 這行是設定對 mock 物件的期望行為。
+// EXPECT() 表示接下來要定義期望的呼叫。
+// GetUser("123") 表示期望 GetUser 方法會被呼叫，且參數是 "123"。
+// .Return(&User{Name: "Alice"}, nil) 表示當這個呼叫發生時，mock 會回傳一個 User 結構體（名字是 Alice）和 nil 錯誤。
+mockStore.EXPECT().GetUser("123").Return(&User{Name: "Alice"}, nil)
+```
 
 # 總結
 Mocking 本身是蠻奇妙的東西，它完全是模擬出來的。甚至我們很可能為了讓自己的設計能夠被測試需要去在一個測試案例中 mock 很多依賴物件，但這行為是個值得思考的訊號。
