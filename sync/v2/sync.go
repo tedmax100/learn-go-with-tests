@@ -1,11 +1,11 @@
-package v1
+package v2
 
 import "sync"
 
 // Counter will increment a number.
 type Counter struct {
 	mu    sync.Mutex
-	value int
+	value int64
 }
 
 // NewCounter returns a new Counter.
@@ -21,6 +21,6 @@ func (c *Counter) Inc() {
 }
 
 // Value returns the current count.
-func (c *Counter) Value() int {
+func (c *Counter) Value() int64 {
 	return c.value
 }
