@@ -216,6 +216,170 @@ ok      github.com/quii/learn-go-with-tests/sync/v2     0.004s
 # Bonus
 ## Go test race 檢測器
 
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+)
+
+func main() {
+	start := time.Now()
+	var t *time.Timer
+	t = time.AfterFunc(randomDuration(), func() {
+		fmt.Println(time.Now().Sub(start))
+		t.Reset(randomDuration())
+	})
+
+	time.Sleep(5 * time.Second)
+}
+
+func randomDuration() time.Duration {
+	return time.Duration(rand.Int63n(1e9))
+}
+```
+
+這段其實也隱藏著 race condition 問題。
+Go 身為 cloud native 常用語言，提供了 Race detector 的工具。
+我們可以 `go test -race ./...` 或者 `go run -race xxx.go` 或是 `go build -race xxx` 只要加入 `-race`就能啟用 race 檢測。
+
+```bash
+go run -race main.go
+==================
+WARNING: DATA RACE
+Read at 0x00c00005c040 by goroutine 8:
+  main.main.func1()
+      /home/nathan/Project/learn-go-with-tests/sync/v3/main.go:14 +0xd3
+
+Previous write at 0x00c00005c040 by main goroutine:
+  main.main()
+      /home/nathan/Project/learn-go-with-tests/sync/v3/main.go:12 +0x159
+
+Goroutine 8 (running) created at:
+  time.goFunc()
+      /usr/local/go/src/time/sleep.go:215 +0x44
+```
+
+來移到單元測試中，第一個測試案例是原本main.go會發生race condition的版本。第二個是用mutex lock 來修復問題。第三個則是利用recursive function 來修復。
+
+```go
+package main_test
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"testing"
+	"time"
+)
+
+// TestTimerRaceCondition
+func TestTimerRaceCondition(t *testing.T) {
+	start := time.Now()
+	var timer *time.Timer
+
+	timer = time.AfterFunc(randomDuration(), func() {
+		fmt.Println(time.Now().Sub(start))
+		timer.Reset(randomDuration())
+	})
+
+	time.Sleep(1 * time.Second)
+}
+
+// TestTimerWithMutex
+func TestTimerWithMutex(t *testing.T) {
+	start := time.Now()
+	var timer *time.Timer
+	var mu sync.Mutex
+
+	mu.Lock()
+	timer = time.AfterFunc(randomDuration(), func() {
+		mu.Lock()
+		fmt.Println(time.Now().Sub(start))
+		timer.Reset(randomDuration())
+		mu.Unlock()
+	})
+	mu.Unlock()
+
+	time.Sleep(1 * time.Second)
+}
+
+// TestTimerWithRecursiveFunc
+func TestTimerWithRecursiveFunc(t *testing.T) {
+	start := time.Now()
+
+	var scheduleNext func()
+	scheduleNext = func() {
+		fmt.Println(time.Now().Sub(start))
+		time.AfterFunc(randomDuration(), scheduleNext)
+	}
+
+	time.AfterFunc(randomDuration(), scheduleNext)
+
+	time.Sleep(1 * time.Second)
+}
+
+func randomDuration() time.Duration {
+	return time.Duration(rand.Int63n(1e9))
+}
+```
+
+```bash
+> go test -race -run TestTimerRaceCondition
+529.648825ms
+==================
+WARNING: DATA RACE
+Read at 0x00c00011e090 by goroutine 9:
+  github.com/quii/learn-go-with-tests/sync/v3_test.TestTimerRaceCondition.func1()
+      /home/nathan/Project/learn-go-with-tests/sync/v3/timer_test.go:18 +0xd3
+
+Previous write at 0x00c00011e090 by goroutine 7:
+  github.com/quii/learn-go-with-tests/sync/v3_test.TestTimerRaceCondition()
+      /home/nathan/Project/learn-go-with-tests/sync/v3/timer_test.go:16 +0x159
+  testing.tRunner()
+      /usr/local/go/src/testing/testing.go:1792 +0x225
+  testing.(*T).Run.gowrap1()
+      /usr/local/go/src/testing/testing.go:1851 +0x44
+
+Goroutine 9 (running) created at:
+  time.goFunc()
+      /usr/local/go/src/time/sleep.go:215 +0x44
+
+Goroutine 7 (running) created at:
+  testing.(*T).Run()
+      /usr/local/go/src/testing/testing.go:1851 +0x8f2
+  testing.runTests.func1()
+      /usr/local/go/src/testing/testing.go:2279 +0x85
+  testing.tRunner()
+      /usr/local/go/src/testing/testing.go:1792 +0x225
+  testing.runTests()
+      /usr/local/go/src/testing/testing.go:2277 +0x96c
+  testing.(*M).Run()
+      /usr/local/go/src/testing/testing.go:2142 +0xeea
+  main.main()
+      _testmain.go:51 +0x164
+==================
+```
+
+也能對另外兩個執行測試，結果都是 Pass
+```bash
+go test -race -run TestTimerWithMutex
+go test -race -run TestTimerWithRecursiveFunc
+```
+
+在錯誤報告中明確指出，在 `t.Reset(randomDuration())` 讀取了 `t`。且在main goroutine 中，`t = time.AfterFunc(...)` 修改了 `t`。
+
+main goroutine：建立一個變數 t，然後建立一個timer，並"打算"把timer 賦值给t
+Timer goroutine：timer可能會非常快地觸發，並開始執行callback function，callback function嘗試使用變數t
+
+問題就在於這是一場"賽跑"：
+- 如果main goroutine先完成赋值操作，那麼一切正常
+- 如果Timer goroutine比較"積極快速"，可能在t被正確賦值之前就嘗試使用它，此時就會發生race condition。
+
+這是一個典型的資料競爭場景：一個變數（t）被多個協程同時訪問，其中至少一個是寫入操作，而這些操作之間沒有同步機制。
+
 ## Go dead lock 分析
 
 ## More Go 併發練習
