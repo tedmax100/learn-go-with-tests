@@ -381,5 +381,212 @@ Timer goroutine：timer可能會非常快地觸發，並開始執行callback fun
 這是一個典型的資料競爭場景：一個變數（t）被多個協程同時訪問，其中至少一個是寫入操作，而這些操作之間沒有同步機制。
 
 ## Go dead lock 分析
+Go的死鎖情況可能非常隱蔽，特別是在使用多個鎖和通道時。以下我們將探討一些更複雜的死鎖場景。
 
-## More Go 併發練習
+### 讀寫鎖的隱形死鎖
+讀寫鎖(sync.RWMutex)是Go中常用的同步原語，但如果使用不當，容易形成死鎖。以下是一個經典的隱形死鎖示例：
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func main() {
+	var rwMutex sync.RWMutex
+	ch := make(chan int) // unbuffered channel
+	
+	// goroutine 1：hold write lock，send msg to channel
+	go func() {
+		rwMutex.Lock() 
+		fmt.Println("goroutine1：獲取寫鎖，準備發送到通道")
+		ch <- 123  // 阻塞等待接收者
+		fmt.Println("goroutine1：發送完成，釋放寫鎖")
+		rwMutex.Unlock()
+	}()
+	
+	time.Sleep(100 * time.Millisecond) // 確保goroutine1先執行
+	
+	// goroutine2：try to octain read lock, and receive msg from channel
+	go func() {
+		fmt.Println("goroutine2：嘗試獲取讀鎖")
+		rwMutex.RLock() // 阻塞，因為協程1持有寫鎖
+		fmt.Println("goroutine2：獲取到讀鎖，準備從通道接收")
+		x := <-ch
+		fmt.Println("goroutine2：讀到", x)
+		rwMutex.RUnlock()
+	}()
+	
+	time.Sleep(2 * time.Second)
+	fmt.Println("結束")
+}
+```
+這是一個典型的死鎖情況：
+1. 協程1獲取寫鎖，然後嘗試發送到通道，但因為無人接收而阻塞
+2. 協程2嘗試獲取讀鎖，但因為協程1持有寫鎖而阻塞
+3. 結果：協程1等待協程2接收數據，而協程2等待協程1釋放鎖，形成循環等待
+
+
+
+### 多鎖死鎖（鎖順序問題）
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func main() {
+	var lockA, lockB sync.Mutex
+	
+	// goroutine 1：先獲取A鎖，然後嘗試獲取B鎖
+	go func() {
+		lockA.Lock()
+		fmt.Println("goroutine 1：獲取鎖A")
+		time.Sleep(100 * time.Millisecond) // 模擬工作
+		fmt.Println("goroutine 1：嘗試獲取鎖B")
+		lockB.Lock()
+		fmt.Println("goroutine 1：獲取到鎖B")
+		// 操作共享資源
+		lockB.Unlock()
+		lockA.Unlock()
+	}()
+	
+	// goroutine 2：先獲取B鎖，然後嘗試獲取A鎖（順序與協程1相反）
+	go func() {
+		lockB.Lock()
+		fmt.Println("goroutine 2：獲取鎖B")
+		time.Sleep(100 * time.Millisecond) // 模擬工作
+		fmt.Println("goroutine 2：嘗試獲取鎖A")
+		lockA.Lock()
+		fmt.Println("goroutine 2：獲取到鎖A")
+		// 操作共享資源
+		lockA.Unlock()
+		lockB.Unlock()
+	}()
+	
+	time.Sleep(2 * time.Second)
+	fmt.Println("可能已死鎖")
+}
+```
+
+這種情況是經典的"資源獲取順序"問題：
+1. 協程1獲取鎖A，然後嘗試獲取鎖B
+2. 同時協程2獲取鎖B，然後嘗試獲取鎖A
+3. 兩個協程互相等待對方釋放鎖，形成死鎖
+
+### 混合使用多種同步原語
+
+更複雜的死鎖可能涉及多種同步原語的混合使用：
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func main() {
+	var mutex sync.Mutex
+	cond := sync.NewCond(&mutex)
+	ready := false
+	
+	// 控制協程
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		mutex.Lock()
+		// 在沒有調用Broadcast的情況下解鎖
+		// 忘記了喚醒等待的協程
+		ready = true
+		mutex.Unlock()
+		fmt.Println("控制協程：狀態已設置，但忘記發送信號")
+	}()
+	
+	// 工作協程
+	for i := 0; i < 3; i++ {
+		go func(id int) {
+			mutex.Lock()
+			for !ready {
+				fmt.Printf("工作協程%d：等待信號\n", id)
+				cond.Wait() // 等待條件變量信號
+			}
+			fmt.Printf("工作協程%d：收到信號，開始工作\n", id)
+			mutex.Unlock()
+		}(i)
+	}
+	
+	time.Sleep(3 * time.Second)
+	fmt.Println("程序結束：工作協程可能永遠被阻塞")
+}
+```
+
+在這個例子中：
+1. 工作協程等待條件變量信號
+2. 控制協程設置了條件，但忘記調用`cond.Broadcast()`或`cond.Signal()`
+3. 工作協程將永遠阻塞在`cond.Wait()`
+
+避免死鎖的最佳實踐：
+- 保持一致的鎖獲取順序
+- 避免在持有鎖時進行阻塞操作
+- 優先使用通道進行同步而非鎖
+- 使用帶timeout 的 context 或 select default 語句避免永久阻塞
+- 定期審查並發程式邏輯
+
+Channel 亂用也是有可能 race condition/deadlock
+
+
+> When to use locks over channels and goroutines?
+> - Use channels when passing ownership of data
+> - Use mutexes for managing state，也因為 mudex 是用來實現互斥鎖的，所以別 copy 它。
+> 如果將包含 sync.Mutex 的對象pass by value（這等於複製了一份mutex），也會複製互斥鎖的內部狀態，這會導致︰
+> - 鎖的狀態被複製，兩個不同的鎖實例實際上指向同一個底層資源，很可能導致鎖的行為異常
+> - 也可能因為被複製，出現dead lock、data racing 等難以除錯的問題
+> - `go vet` 工具可以檢測這種複製的問題，並提供錯誤提醒。
+
+```go
+package v5
+
+import (
+	"sync"
+)
+
+type Counter struct {
+	mu    sync.Mutex
+	value int
+}
+
+func (c *Counter) Inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
+}
+
+func (c *Counter) Value() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+```
+
+```bash
+go vet ./...
+# github.com/quii/learn-go-with-tests/sync/v5
+# [github.com/quii/learn-go-with-tests/sync/v5]
+./counter_test.go:9:38: assertCounter passes lock by value: github.com/quii/learn-go-with-tests/sync/v5.Counter contains sync.Mutex
+./counter_test.go:24:20: call of assertCounter copies lock value: github.com/quii/learn-go-with-tests/sync/v5.Counter contains sync.Mutex
+./counter_test.go:42:20: call of assertCounter copies lock value: github.com/quii/learn-go-with-tests/sync/v5.Counter contains sync.Mutex
+(base) 
+```
+
+
+https://zhuanlan.zhihu.com/p/405699766
+https://zhuanlan.zhihu.com/p/375530785
+https://brantou.github.io/2017/05/23/go-race-detector/
